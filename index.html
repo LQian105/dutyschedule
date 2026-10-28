@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#087d40" />
+    <title>值班表</title>
+    <link rel="stylesheet" href="styles.css?v=20261028-7" />
+  </head>
+  <body>
+    <button id="desktop-login-avatar" class="desktop-login-avatar" type="button" aria-label="登录" title="登录"></button>
+    <div id="desktop-schedule-actions" class="desktop-schedule-actions" hidden aria-label="排班修改操作">
+      <button id="save-schedule-changes" class="button button-primary desktop-action-button" type="button" disabled>保存修改</button>
+      <button id="restore-schedule-changes" class="button button-primary desktop-action-button" type="button" disabled>一键恢复</button>
+      <button id="restore-default-schedule" class="button button-primary desktop-action-button" type="button" hidden>默认排班</button>
+    </div>
+    <dialog id="login-dialog" class="login-dialog" aria-labelledby="login-dialog-title">
+      <form id="login-form" class="login-form" novalidate>
+        <div class="login-dialog-heading">
+          <p class="section-kicker">账户登录</p>
+          <h2 id="login-dialog-title">登录</h2>
+          <p>请输入账户和密码</p>
+        </div>
+        <label>
+          <span>账户</span>
+          <input id="login-account" type="text" autocomplete="username" required />
+        </label>
+        <label>
+          <span>密码</span>
+          <input id="login-password" type="password" autocomplete="current-password" required />
+        </label>
+        <p id="login-feedback" class="login-feedback" role="alert" aria-live="polite"></p>
+        <div class="login-actions">
+          <button id="login-cancel" class="button button-secondary" type="button">取消</button>
+          <button class="button button-primary" type="submit">登录</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="logout-dialog" class="login-dialog logout-dialog" aria-labelledby="logout-dialog-title">
+      <form id="logout-form" class="login-form" method="dialog">
+        <div class="login-dialog-heading">
+          <p class="section-kicker">账户登录</p>
+          <h2 id="logout-dialog-title">退出登录</h2>
+          <p>确定要退出当前登录吗？</p>
+        </div>
+        <div class="login-actions">
+          <button class="button button-secondary" type="submit">取消</button>
+          <button id="logout-confirm" class="button button-primary" type="button">确认退出</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="schedule-action-dialog" class="login-dialog" aria-labelledby="schedule-action-dialog-title">
+      <form class="login-form" method="dialog">
+        <div class="login-dialog-heading">
+          <p class="section-kicker">排班修改</p>
+          <h2 id="schedule-action-dialog-title">确认操作</h2>
+          <p id="schedule-action-dialog-message"></p>
+        </div>
+        <div class="login-actions">
+          <button class="button button-secondary" type="submit">取消</button>
+          <button id="schedule-action-confirm" class="button button-primary" type="button">确认</button>
+        </div>
+      </form>
+    </dialog>
+    <p id="copy-feedback" class="copy-feedback" role="status" aria-live="polite"></p>
+    <main class="page-shell">
+      <section class="panel month-panel" aria-labelledby="month-title">
+        <button id="schedule-fullscreen" class="schedule-fullscreen-button" type="button" aria-pressed="false">⛶ 全屏</button>
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">月度排班</p>
+            <h2 id="month-title">值班表</h2>
+            <p class="fullscreen-tip">横屏观看效果更佳</p>
+          </div>
+          <div class="month-form" aria-label="选择查看月份">
+            <label>
+              <span>年份</span>
+              <input id="year-input" type="number" inputmode="numeric" min="2026" max="2100" aria-label="年份" />
+            </label>
+            <label>
+              <span>月份</span>
+              <input id="month-input" type="number" inputmode="numeric" min="1" max="12" aria-label="月份" />
+            </label>
+            <button id="go-month" class="button button-primary" type="button">查看当月</button>
+          </div>
+        </div>
+
+        <div class="month-navigation" aria-label="月份切换">
+          <button id="previous-month" class="button button-secondary" type="button" aria-label="查看上个月">‹ <span>上个月</span></button>
+          <button id="return-current-month" class="button button-current" type="button">回到本月</button>
+          <button id="next-month" class="button button-secondary" type="button" aria-label="查看下个月"><span>下个月</span> ›</button>
+        </div>
+
+        <div class="legend" aria-label="班次颜色说明">
+          <span><i class="legend-swatch rest"></i>休息</span>
+          <span><i class="legend-swatch night"></i>含晚班</span>
+          <span><i class="legend-swatch day"></i>早／中班</span>
+          <span><i class="legend-swatch weekend"></i>周末</span>
+        </div>
+
+        <div class="table-hint">可左右滑动查看整月排班</div>
+        <div class="table-scroll" tabindex="0" aria-label="月度值班表，可横向滚动">
+          <table id="schedule-table">
+            <caption class="sr-only">全员月度值班表</caption>
+          </table>
+          <div id="legal-overtime-overlays" class="legal-overtime-overlays" aria-hidden="true"></div>
+          <div id="schedule-crosshair" class="schedule-crosshair" aria-hidden="true"></div>
+        </div>
+        <div id="mobile-schedule" class="mobile-schedule" aria-label="手机端按日值班表"></div>
+      </section>
+
+      <section class="today-panel" aria-labelledby="today-title">
+        <h2 id="today-title" class="sr-only">今日排班</h2>
+        <div id="today-schedule" class="today-schedule" aria-label="今日全员排班"></div>
+      </section>
+
+      <section class="panel summary-panel" aria-labelledby="summary-title">
+        <div class="summary-heading">
+          <div>
+            <p class="section-kicker">本月统计</p>
+            <h2 id="summary-title">本月值班统计</h2>
+          </div>
+        </div>
+        <div id="monthly-summary" class="monthly-summary" role="list" aria-label="本月个人值班统计"></div>
+      </section>
+
+      <section class="panel holiday-summary-panel" aria-labelledby="holiday-summary-title">
+        <div class="holiday-summary-heading">
+          <div>
+            <p id="holiday-year-kicker" class="section-kicker">2026 年</p>
+            <h2 id="holiday-summary-title">节假日班次统计</h2>
+          </div>
+          <form id="holiday-summary-form" class="holiday-summary-form">
+            <label>
+              <span>年份</span>
+              <input id="holiday-year-input" type="number" inputmode="numeric" min="2026" max="2100" required aria-label="统计年份" />
+            </label>
+            <button class="button button-primary" type="submit">查看年度</button>
+          </form>
+        </div>
+        <div id="holiday-summary" class="holiday-summary" aria-label="年度节假日班次统计"></div>
+      </section>
+    </main>
+
+    <footer>仅供参考</footer>
+    <nav class="mobile-page-nav" aria-label="页面导航">
+      <button id="go-page-top" type="button" aria-label="回到页面顶部" title="回到顶部">↑</button>
+      <button id="go-page-middle" type="button" aria-label="前往页面中间" title="页面中间">●</button>
+      <button id="go-page-bottom" type="button" aria-label="前往页面底部" title="前往底部">↓</button>
+    </nav>
+    <script src="app.js?v=20261028-16"></script>
+  </body>
+</html>
