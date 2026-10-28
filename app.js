@@ -1,6 +1,9 @@
 "use strict";
 
 const ANCHOR = { year: 2026, month: 7, day: 1 };
+// 这是专门给浏览器使用的公开连接信息；数据库密码和 secret key 绝不能放在这里。
+const SUPABASE_URL = "https://pjwuvndypgaxbwyuebrr.supabase.co";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_UJP7ddqXRCHcQebrS1eezw_-DYFBpbV";
 const SCHEDULE_START_DATE = new Date(2026, 6, 1);
 const SCHEDULE_END_DATE = new Date(2100, 11, 1);
 const WEEKDAYS = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
@@ -100,6 +103,8 @@ const shiftOverrides = {};
 const SCHEDULE_STORAGE_KEY = "duty-roster-saved-overrides";
 let savedShiftOverrides = loadSavedOverrides();
 let loggedIn = false;
+let supabaseAccessToken = null;
+let cloudSaveInProgress = false;
 let copyFeedbackTimer = null;
 let pendingScheduleAction = null;
 const GOLD_FLOW_DURATION_MS = 1800;
@@ -281,6 +286,72 @@ function loadSavedOverrides() {
   } catch (_) {
     return {};
   }
+}
+
+function isValidShift(shift) {
+  return typeof shift === "string" && /^[休早中晚+|]+$/.test(shift);
+}
+
+function saveLocalFallback(overrides) {
+  try {
+    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(overrides));
+  } catch (_) {
+    // 云端保存成功时，本机缓存失败不影响其他设备同步。
+  }
+}
+
+async function supabaseRequest(path, options = {}) {
+  const response = await fetch(`${SUPABASE_URL}${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_PUBLISHABLE_KEY,
+      ...(options.headers || {})
+    }
+  });
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch (_) {
+    payload = text;
+  }
+  if (!response.ok) {
+    const message = payload?.message || payload?.error_description || payload?.hint || "云端服务暂时无法完成此操作。";
+    throw new Error(message);
+  }
+  return payload;
+}
+
+function cloudOverridesFromRows(rows) {
+  if (!Array.isArray(rows)) return {};
+  const names = new Set(staff.map((person) => person.name));
+  return Object.fromEntries(rows.flatMap((row) => {
+    if (!names.has(row.staff_name) || !/^\d{4}-\d{2}-\d{2}$/.test(row.shift_date || "") || !isValidShift(row.shift)) return [];
+    const date = dateFromIso(row.shift_date);
+    return row.shift === getBaseShift(row.staff_name, date) ? [] : [[overrideKey(row.staff_name, date), row.shift]];
+  }));
+}
+
+async function loadCloudOverrides() {
+  const rows = await supabaseRequest("/rest/v1/schedule_overrides?select=staff_name,shift_date,shift", {
+    headers: { Authorization: `Bearer ${SUPABASE_PUBLISHABLE_KEY}` }
+  });
+  const overrides = cloudOverridesFromRows(rows);
+  savedShiftOverrides = overrides;
+  saveLocalFallback(overrides);
+  replaceShiftOverrides(overrides);
+  return overrides;
+}
+
+function cloudErrorMessage(error, fallback) {
+  const message = String(error?.message || "").toLowerCase();
+  if (message.includes("row-level security") || message.includes("permission denied")) {
+    return "当前账户没有保存排班的权限。";
+  }
+  if (message.includes("failed to fetch") || message.includes("networkerror")) {
+    return "无法连接云端，请检查网络后重试。";
+  }
+  return fallback;
 }
 
 function replaceShiftOverrides(overrides) {
@@ -1134,23 +1205,63 @@ function updateScheduleActionButtons() {
   saveScheduleChangesButton.hidden = !hasChanges;
   restoreScheduleChangesButton.hidden = !hasChanges;
   restoreDefaultScheduleButton.hidden = !canManageChanges || !hasCurrentCustomSchedule;
-  saveScheduleChangesButton.disabled = !hasChanges;
+  saveScheduleChangesButton.disabled = !hasChanges || cloudSaveInProgress;
   restoreScheduleChangesButton.disabled = !hasChanges;
 }
 
-function saveScheduleChanges() {
-  if (!isLoggedIn() || !hasUnsavedScheduleChangesInDisplayedMonth()) return;
+async function saveCurrentMonthToCloud(nextCurrentMonthOverrides) {
+  if (!supabaseAccessToken) throw new Error("请先登录管理员账户。");
+  const currentSavedOverrides = overridesForDisplayedMonth(savedShiftOverrides);
+  const nextEntries = Object.entries(nextCurrentMonthOverrides);
+  const nextKeys = new Set(nextEntries.map(([key]) => key));
+  const headers = {
+    Authorization: `Bearer ${supabaseAccessToken}`,
+    "Content-Type": "application/json"
+  };
+
+  const deletions = Object.keys(currentSavedOverrides).filter((key) => !nextKeys.has(key));
+  await Promise.all(deletions.map((key) => {
+    const separatorIndex = key.lastIndexOf("|");
+    const name = key.slice(0, separatorIndex);
+    const date = key.slice(separatorIndex + 1);
+    return supabaseRequest(`/rest/v1/schedule_overrides?staff_name=eq.${encodeURIComponent(name)}&shift_date=eq.${date}`, {
+      method: "DELETE",
+      headers
+    });
+  }));
+
+  if (nextEntries.length) {
+    const rows = nextEntries.map(([key, shift]) => {
+      const separatorIndex = key.lastIndexOf("|");
+      return {
+        staff_name: key.slice(0, separatorIndex),
+        shift_date: key.slice(separatorIndex + 1),
+        shift,
+        updated_at: new Date().toISOString()
+      };
+    });
+    await supabaseRequest("/rest/v1/schedule_overrides?on_conflict=staff_name,shift_date", {
+      method: "POST",
+      headers: { ...headers, Prefer: "resolution=merge-duplicates,return=minimal" },
+      body: JSON.stringify(rows)
+    });
+  }
+}
+
+async function saveScheduleChanges() {
+  if (!isLoggedIn() || !hasUnsavedScheduleChangesInDisplayedMonth() || cloudSaveInProgress) return;
+  cloudSaveInProgress = true;
+  updateScheduleActionButtons();
   try {
-    const nextSavedOverrides = {
-      ...Object.fromEntries(Object.entries(savedShiftOverrides).filter(([key]) => !overrideBelongsToDisplayedMonth(key))),
-      ...overridesForDisplayedMonth(shiftOverrides)
-    };
-    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(nextSavedOverrides));
-    savedShiftOverrides = nextSavedOverrides;
+    await saveCurrentMonthToCloud(overridesForDisplayedMonth(shiftOverrides));
+    await loadCloudOverrides();
+    renderMonth(displayedDate.getFullYear(), displayedDate.getMonth());
+    showCopyFeedback("排班修改已保存并同步到云端。" );
+  } catch (error) {
+    showCopyFeedback(cloudErrorMessage(error, "云端保存失败，当前修改尚未保存。"), true);
+  } finally {
+    cloudSaveInProgress = false;
     updateScheduleActionButtons();
-    showCopyFeedback("排班修改已保存到本机。" );
-  } catch (_) {
-    showCopyFeedback("浏览器未允许本机保存，修改未能保存。", true);
   }
 }
 
@@ -1164,21 +1275,20 @@ function restoreScheduleChanges() {
   showCopyFeedback("已恢复到上次保存的排班。" );
 }
 
-function restoreDefaultSchedule() {
-  if (!isLoggedIn()) return;
+async function restoreDefaultSchedule() {
+  if (!isLoggedIn() || cloudSaveInProgress) return;
+  cloudSaveInProgress = true;
+  updateScheduleActionButtons();
   try {
-    const nextSavedOverrides = Object.fromEntries(
-      Object.entries(savedShiftOverrides).filter(([key]) => !overrideBelongsToDisplayedMonth(key))
-    );
-    localStorage.setItem(SCHEDULE_STORAGE_KEY, JSON.stringify(nextSavedOverrides));
-    savedShiftOverrides = nextSavedOverrides;
-    Object.keys(shiftOverrides)
-      .filter(overrideBelongsToDisplayedMonth)
-      .forEach((key) => delete shiftOverrides[key]);
+    await saveCurrentMonthToCloud({});
+    await loadCloudOverrides();
     renderMonth(displayedDate.getFullYear(), displayedDate.getMonth());
-    showCopyFeedback("已恢复本月默认排班。" );
-  } catch (_) {
-    showCopyFeedback("浏览器未允许更新本机保存的数据。", true);
+    showCopyFeedback("已恢复本月默认排班，并同步到云端。" );
+  } catch (error) {
+    showCopyFeedback(cloudErrorMessage(error, "恢复默认排班失败，请稍后重试。"), true);
+  } finally {
+    cloudSaveInProgress = false;
+    updateScheduleActionButtons();
   }
 }
 
@@ -1318,27 +1428,63 @@ loginDialog.addEventListener("click", (event) => {
 logoutDialog.addEventListener("click", (event) => {
   if (event.target === logoutDialog) logoutDialog.close();
 });
-loginForm.addEventListener("submit", (event) => {
+loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (loginAccount.value === "tao" && loginPassword.value === "1985") {
+  const email = loginAccount.value.trim();
+  const password = loginPassword.value;
+  if (!email || !password) return;
+  loginFeedback.textContent = "正在验证登录信息…";
+  const submitButton = loginForm.querySelector('button[type="submit"]');
+  submitButton.disabled = true;
+  try {
+    const session = await supabaseRequest("/auth/v1/token?grant_type=password", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${SUPABASE_PUBLISHABLE_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ email, password })
+    });
+    if (!session?.access_token) throw new Error("邮箱或密码错误。");
+    supabaseAccessToken = session.access_token;
+    await loadCloudOverrides();
     replaceShiftOverrides(savedShiftOverrides);
     loggedIn = true;
     updateLoginAvatar(true);
     renderMonth(displayedDate.getFullYear(), displayedDate.getMonth());
     loginDialog.close();
-    return;
+    showCopyFeedback("管理员登录成功。" );
+  } catch (error) {
+    supabaseAccessToken = null;
+    loggedIn = false;
+    updateLoginAvatar(false);
+    const details = String(error?.message || "").toLowerCase();
+    loginFeedback.textContent = details.includes("email not confirmed")
+      ? "该邮箱尚未确认，请在 Supabase 后台确认用户后重试。"
+      : "邮箱或密码错误，无法登录。";
+    loginPassword.focus();
+  } finally {
+    submitButton.disabled = false;
   }
-  loggedIn = false;
-  updateLoginAvatar(false);
-  loginFeedback.textContent = "账户或密码错误，无法登录。";
-  loginPassword.focus();
 });
-document.querySelector("#logout-confirm").addEventListener("click", () => {
+document.querySelector("#logout-confirm").addEventListener("click", async () => {
+  const token = supabaseAccessToken;
+  supabaseAccessToken = null;
   loggedIn = false;
   replaceShiftOverrides(savedShiftOverrides);
   updateLoginAvatar(false);
   renderMonth(displayedDate.getFullYear(), displayedDate.getMonth());
   logoutDialog.close();
+  if (token) {
+    try {
+      await supabaseRequest("/auth/v1/logout", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+    } catch (_) {
+      // 本页已丢弃令牌，即使网络中断也不会维持页面登录状态。
+    }
+  }
 });
 scheduleActionDialog.addEventListener("click", (event) => {
   if (event.target === scheduleActionDialog) scheduleActionDialog.close();
@@ -1360,6 +1506,11 @@ updateLoginAvatar(false);
 
 replaceShiftOverrides(savedShiftOverrides);
 renderMonth(displayedDate.getFullYear(), displayedDate.getMonth());
+
+// 云端数据是最终来源。网络暂时不可用时，页面仍会先展示本机缓存的排班。
+loadCloudOverrides()
+  .then(() => renderMonth(displayedDate.getFullYear(), displayedDate.getMonth()))
+  .catch(() => console.warn("暂时无法读取云端排班，将显示本机缓存。"));
 
 // 供浏览器控制台核对，月表和查询功能均通过同一方法计算班次。
 window.getShift = getShift;
