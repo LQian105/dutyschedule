@@ -1413,7 +1413,6 @@ async function copyScheduleForExcel() {
 table.addEventListener("dblclick", (event) => {
   if (!event.target.closest("thead tr:first-child .corner")) return;
   event.preventDefault();
-  if (!isLoggedIn()) return;
   copyScheduleForExcel();
 });
 
